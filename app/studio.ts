@@ -12,7 +12,7 @@ export const ACCEPTED_TYPES = ["image/jpeg", "image/png", "image/webp"];
 export const ACCEPT_ATTRIBUTE = ACCEPTED_TYPES.join(",");
 
 export type Mode = "restore" | "generate";
-export type Target = "new" | "refine";
+export type Target = "new" | "refine" | "markup";
 export type PromptPreset = "restore" | "colorize";
 export type ComparisonSide = "left" | "right";
 export type Dimensions = { width: number; height: number };
@@ -30,16 +30,25 @@ export function promptForPreset(
 
 export const MODEL_OPTIONS = [
   {
-    value: "gpt-image-2.5-sunburst",
+    value: "gpt-image-2.6-sunburst",
     label: "Sunburst",
     detail: "Precise editing",
   },
   {
-    value: "gpt-image-2.5-flare",
+    value: "gpt-image-2.6-flare",
     label: "Flare",
     detail: "Faster edits",
   },
 ] as const;
+
+// The app-wide model version. Options and presets store 2.6 ids; requests
+// swap in the chosen version.
+export const MODEL_GENERATIONS = ["2.6", "2.5"] as const;
+export type ModelGeneration = (typeof MODEL_GENERATIONS)[number];
+
+export function withGeneration(model: string, generation: ModelGeneration): string {
+  return model.replace(/^gpt-image-\d+(?:\.\d+)?-/, `gpt-image-${generation}-`);
+}
 
 export const QUALITY_OPTIONS = [
   ["auto", "Auto"],
@@ -49,6 +58,17 @@ export const QUALITY_OPTIONS = [
   ["xhigh", "Extra high"],
   ["max", "Maximum"],
 ] as const;
+
+// How much the model plans before drawing. "auto" uses the model default (high).
+export const COMPLEXITY_OPTIONS = [
+  ["auto", "Auto"],
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"],
+] as const;
+
+// OpenAI's limit for the image being marked up and for the markup layer.
+export const MAX_MARKUP_PIXELS = 16_777_216;
 
 export const RESTORE_SIZE_OPTIONS = [
   ["auto", "Auto (model-selected)"],
@@ -153,6 +173,8 @@ export type RestoreMetadata = {
   model: string;
   size: string;
   quality: string;
+  complexity?: string;
+  markup?: boolean;
   outputFormat: string;
   durationMs?: number;
   usage?: Usage;
@@ -166,6 +188,7 @@ export type RestoreVersion = {
   imageDataUrl: string;
   metadata: RestoreMetadata;
   prompt: string;
+  // Empty for Image API edits, which can't be continued with previous_response_id.
   responseId: string;
   parentVersionId: string | null;
   sourceName: string | null;
@@ -220,6 +243,9 @@ export function normalizeMetadata(
     size: typeof metadata.size === "string" ? metadata.size : fallback.size,
     quality:
       typeof metadata.quality === "string" ? metadata.quality : fallback.quality,
+    complexity:
+      typeof metadata.complexity === "string" ? metadata.complexity : undefined,
+    markup: metadata.markup === true,
     outputFormat:
       typeof metadata.outputFormat === "string" ? metadata.outputFormat : "png",
     durationMs: optionalNumber(metadata.durationMs),
@@ -274,8 +300,32 @@ export function formatTokenCount(tokenCount: number | undefined): string {
   return tokenCount === undefined ? "Unavailable" : tokenCount.toLocaleString();
 }
 
+// "Sunburst" for the current version, "Sunburst 2.5" for older ones.
 export function modelLabel(model: string): string {
-  return MODEL_OPTIONS.find((option) => option.value === model)?.label ?? model;
+  const match = /^gpt-image-([\d.]+)-(.+)$/.exec(model);
+  const option = match
+    ? MODEL_OPTIONS.find(
+        (candidate) => candidate.value === withGeneration(model, MODEL_GENERATIONS[0]),
+      )
+    : undefined;
+  if (!match || !option) {
+    return model;
+  }
+
+  return match[1] === MODEL_GENERATIONS[0] ? option.label : `${option.label} ${match[1]}`;
+}
+
+// Short summary of the settings behind a version, e.g. "Flare · high".
+export function settingsLabel(settings: {
+  model: string;
+  quality: string;
+  complexity?: string;
+}): string {
+  const parts = [modelLabel(settings.model), settings.quality];
+  if (settings.complexity && settings.complexity !== "auto") {
+    parts.push(`${settings.complexity} complexity`);
+  }
+  return parts.join(" · ");
 }
 
 export function downloadName(version: RestoreVersion): string {

@@ -2,8 +2,11 @@ import { NextResponse } from "next/server";
 
 import {
   MalformedImageResponseError,
+  editImage,
   restoreImage,
+  validateEditInput,
   validateRestoreInput,
+  type RestoreImageResult,
 } from "@/lib/restore";
 
 export const runtime = "nodejs";
@@ -103,6 +106,9 @@ export async function POST(request: Request) {
   const model = formData.get("model");
   const size = formData.get("size");
   const quality = formData.get("quality");
+  const complexity = formData.get("complexity") ?? "auto";
+  const editImageFile = formData.get("editImage");
+  const markup = formData.get("markup");
   const previousResponseId = formData.get("previousResponseId");
   const referenceImages = formData.getAll("referenceImage");
 
@@ -118,6 +124,9 @@ export async function POST(request: Request) {
     typeof model !== "string" ||
     typeof size !== "string" ||
     typeof quality !== "string" ||
+    typeof complexity !== "string" ||
+    (editImageFile !== null && !(editImageFile instanceof File)) ||
+    (markup !== null && !(markup instanceof File)) ||
     (previousResponseId !== null && typeof previousResponseId !== "string") ||
     referenceImages.some((referenceImage) => !(referenceImage instanceof File))
   ) {
@@ -126,60 +135,106 @@ export async function POST(request: Request) {
     });
   }
 
-  // Generate mode never sends a source photograph, even if one was attached.
-  const sourceImage = mode === "restore" ? image : null;
-  const validation = validateRestoreInput({
-    mode,
-    image: sourceImage
-      ? { imageType: sourceImage.type, imageSize: sourceImage.size }
-      : undefined,
-    prompt,
-    model,
-    size,
-    quality,
-    previousResponseId: previousResponseId ?? undefined,
-    referenceImages: referenceImages.map((referenceImage) => {
-      const file = referenceImage as File;
-      return { imageType: file.type, imageSize: file.size };
-    }),
-  });
+  const readFile = async (file: File) => Buffer.from(await file.arrayBuffer());
+  const referenceFiles = referenceImages as File[];
+  const referenceMeta = referenceFiles.map((file) => ({
+    imageType: file.type,
+    imageSize: file.size,
+  }));
 
-  if (!validation.ok) {
-    return NextResponse.json(errorPayload(validation.message), {
-      status: validation.status,
-    });
-  }
+  let result: RestoreImageResult;
+  let settings: { model: string; size: string; quality: string; complexity: string };
 
   try {
-    const result = await restoreImage({
-      apiKey,
-      image: sourceImage
-        ? {
-            bytes: Buffer.from(await sourceImage.arrayBuffer()),
-            name: sourceImage.name || "photo",
-            type: sourceImage.type,
-          }
-        : undefined,
-      referenceImages: await Promise.all(
-        referenceImages.map(async (referenceImage) => {
-          const file = referenceImage as File;
-          return {
-            bytes: Buffer.from(await file.arrayBuffer()),
+    if (editImageFile) {
+      // A direct Image API edit, optionally guided by a drawn markup layer.
+      const validation = validateEditInput({
+        image: { imageType: editImageFile.type, imageSize: editImageFile.size },
+        markup: markup ? { imageType: markup.type, imageSize: markup.size } : undefined,
+        referenceImages: referenceMeta,
+        prompt,
+        model,
+        size,
+        quality,
+        complexity,
+      });
+
+      if (!validation.ok) {
+        return NextResponse.json(errorPayload(validation.message), {
+          status: validation.status,
+        });
+      }
+
+      settings = validation.value;
+      result = await editImage({
+        apiKey,
+        image: {
+          bytes: await readFile(editImageFile),
+          name: editImageFile.name || "image",
+          type: editImageFile.type,
+        },
+        markup: markup ? { bytes: await readFile(markup) } : undefined,
+        referenceImages: await Promise.all(
+          referenceFiles.map(async (file) => ({
+            bytes: await readFile(file),
             type: file.type,
-          };
-        }),
-      ),
-      ...validation.value,
-    });
+          })),
+        ),
+        ...validation.value,
+      });
+    } else {
+      // Generate mode never sends a source photograph, even if one was attached.
+      const sourceImage = mode === "restore" ? image : null;
+      const validation = validateRestoreInput({
+        mode,
+        image: sourceImage
+          ? { imageType: sourceImage.type, imageSize: sourceImage.size }
+          : undefined,
+        prompt,
+        model,
+        size,
+        quality,
+        complexity,
+        previousResponseId: previousResponseId ?? undefined,
+        referenceImages: referenceMeta,
+      });
+
+      if (!validation.ok) {
+        return NextResponse.json(errorPayload(validation.message), {
+          status: validation.status,
+        });
+      }
+
+      settings = validation.value;
+      result = await restoreImage({
+        apiKey,
+        image: sourceImage
+          ? {
+              bytes: await readFile(sourceImage),
+              name: sourceImage.name || "photo",
+              type: sourceImage.type,
+            }
+          : undefined,
+        referenceImages: await Promise.all(
+          referenceFiles.map(async (file) => ({
+            bytes: await readFile(file),
+            type: file.type,
+          })),
+        ),
+        ...validation.value,
+      });
+    }
 
     return NextResponse.json({
       imageDataUrl: result.dataUrl,
       responseId: result.responseId,
       metadata: {
-        mode: validation.value.mode,
-        model: validation.value.model,
-        size: validation.value.size,
-        quality: validation.value.quality,
+        mode: mode === "generate" ? "generate" : "restore",
+        model: settings.model,
+        size: settings.size,
+        quality: settings.quality,
+        complexity: settings.complexity,
+        markup: Boolean(editImageFile && markup),
         outputFormat,
         durationMs: Date.now() - startedAt,
         usage: result.usage,

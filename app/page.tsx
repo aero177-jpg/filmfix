@@ -11,14 +11,38 @@ import {
 } from "react";
 
 import { saveApiKey, useApiKey } from "./apiKeyStore";
+import { saveModelGeneration, useModelGeneration } from "./generationStore";
+import { DEFAULT_PRESET, loadPreset, type Variation } from "./batch";
 import { ApiKeyButton } from "./components/ApiKeyButton";
+import { BatchDialog } from "./components/BatchDialog";
 import { ComparisonViewer } from "./components/ComparisonViewer";
+import { GridViewer } from "./components/GridViewer";
+import {
+  NO_ZOOM,
+  MAX_ZOOM,
+  useZoomPan,
+  zoomAt,
+  zoomTransform,
+  type Zoom,
+} from "./components/useZoomPan";
+import { MarkupCanvas } from "./components/MarkupCanvas";
 import { Field, Icon, Segmented, Switch } from "./components/ui";
 import {
+  BRUSH_SIZES,
+  MARKUP_COLORS,
+  brushWidth,
+  renderMarkupPng,
+  type BrushSize,
+  type MarkupStroke,
+} from "./markup";
+import {
   ACCEPT_ATTRIBUTE,
+  COMPLEXITY_OPTIONS,
   GENERATE_SIZE_OPTIONS,
+  MAX_MARKUP_PIXELS,
   MAX_PROMPT_LENGTH,
   MAX_REFERENCE_IMAGES,
+  MODEL_GENERATIONS,
   MODEL_OPTIONS,
   QUALITY_OPTIONS,
   RESTORE_SIZE_OPTIONS,
@@ -35,8 +59,11 @@ import {
   outputSizeForPreset,
   promptForPreset,
   readImageDimensions,
+  settingsLabel,
   validateImageFile,
+  withGeneration,
   type ComparisonSide,
+  type Cost,
   type Dimensions,
   type GalleryItem,
   type GenerateSizePreset,
@@ -49,7 +76,7 @@ import {
 
 const ORIGINAL_ID = "original";
 
-type View = "single" | "compare";
+type View = "single" | "compare" | "grid";
 
 type ReferenceImage = {
   id: string;
@@ -75,6 +102,8 @@ class RestoreRequestError extends Error {
 export default function Home() {
   const formRef = useRef<HTMLFormElement>(null);
   const stageRef = useRef<HTMLElement>(null);
+  const stageBodyRef = useRef<HTMLDivElement>(null);
+  const singleViewerRef = useRef<HTMLDivElement>(null);
   const sourceInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -99,6 +128,22 @@ export default function Home() {
   );
   const [generatePrompt, setGeneratePrompt] = useState("");
   const [refinePrompt, setRefinePrompt] = useState("");
+  const [markupPrompt, setMarkupPrompt] = useState("");
+  const [complexity, setComplexity] = useState("auto");
+  // Strokes belong to one gallery item; switching images starts a fresh drawing.
+  const [markup, setMarkup] = useState<{ itemId: string; strokes: MarkupStroke[] }>({
+    itemId: "",
+    strokes: [],
+  });
+  const [markupColor, setMarkupColor] = useState<string>(MARKUP_COLORS[0][0]);
+  const [brushSize, setBrushSize] = useState<BrushSize>("m");
+  const [isBatchOpen, setIsBatchOpen] = useState(false);
+  const [batchRows, setBatchRows] = useState<Variation[]>(DEFAULT_PRESET);
+  const batchPresetLoadedRef = useRef(false);
+  const [batchProgress, setBatchProgress] = useState({ done: 0, total: 0 });
+  // The latest batch (its base image first) shown by the grid view.
+  const [gridIds, setGridIds] = useState<string[]>([]);
+  const [gridPick, setGridPick] = useState<string | null>(null);
   const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -111,9 +156,13 @@ export default function Home() {
   >({ left: null, right: null });
   const [comparisonPosition, setComparisonPosition] = useState(50);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // Fullscreen zoom, shared by the single and compare views.
+  const [zoom, setZoom] = useState<Zoom>(NO_ZOOM);
+  const [showFullscreenFilmstrip, setShowFullscreenFilmstrip] = useState(true);
   const [isSourceDragging, setIsSourceDragging] = useState(false);
   const [error, setError] = useState<UiError | null>(null);
   const apiKey = useApiKey();
+  const generation = useModelGeneration();
 
   useEffect(() => {
     if (!isProcessing) {
@@ -140,7 +189,11 @@ export default function Home() {
 
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsFullscreen(document.fullscreenElement === stageRef.current);
+      const isStageFullscreen = document.fullscreenElement === stageRef.current;
+      setIsFullscreen(isStageFullscreen);
+      if (!isStageFullscreen) {
+        setZoom(NO_ZOOM);
+      }
     };
 
     document.addEventListener("fullscreenchange", handleFullscreenChange);
@@ -148,12 +201,42 @@ export default function Home() {
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
   }, []);
 
+  const zoomBy = (factor: number) => {
+    const rect = stageBodyRef.current?.getBoundingClientRect();
+    if (rect) {
+      setZoom((current) => zoomAt(current, factor, 0, 0, rect.width, rect.height));
+    }
+  };
+
   useEffect(() => {
-    if (!isFullscreen || view !== "compare") {
+    if (!isFullscreen) {
       return;
     }
 
     const handleFullscreenKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input:not([type=range]), textarea, select")) {
+        return;
+      }
+
+      const zoomKey = { "+": 1.5, "=": 1.5, "-": 1 / 1.5, "0": 0 }[event.key];
+      if (zoomKey !== undefined) {
+        event.preventDefault();
+        if (zoomKey === 0) {
+          setZoom(NO_ZOOM);
+        } else {
+          const rect = stageBodyRef.current?.getBoundingClientRect();
+          if (rect) {
+            setZoom((current) => zoomAt(current, zoomKey, 0, 0, rect.width, rect.height));
+          }
+        }
+        return;
+      }
+
+      if (view !== "compare") {
+        return;
+      }
+
       const nextPosition = {
         ArrowLeft: 0,
         ArrowRight: 100,
@@ -202,10 +285,11 @@ export default function Home() {
     (selectedItem?.kind === "original"
       ? gallery.find((item) => item.kind !== "original")
       : selectedItem);
-  // Restorations compare best against the source; generations against their parent.
+  // Restorations compare best against the source; generations and markup edits
+  // against their parent.
   const parentId = compareRight?.version?.parentVersionId;
   const leftPreference =
-    compareRight?.version?.mode === "generate"
+    compareRight?.version?.mode === "generate" || compareRight?.version?.metadata.markup
       ? [parentId, ORIGINAL_ID]
       : [ORIGINAL_ID, parentId];
   const compareLeft =
@@ -215,24 +299,57 @@ export default function Home() {
       .find((item) => item && item.id !== compareRight?.id) ??
     [...gallery].reverse().find((item) => item.id !== compareRight?.id);
 
-  const focusItem = view === "single" ? selectedItem : compareRight;
+  const focusItem = view === "compare" ? compareRight : selectedItem;
+  const latestGridItems = gridIds
+    .map((id) => findItem(id))
+    .filter((item): item is GalleryItem => item !== undefined);
+  // Fall back to everything when there is no batch (or only its base is left).
+  const gridItems = latestGridItems.length > 1 ? latestGridItems : gallery;
   const focusVersion = focusItem?.version;
-  const effectiveTarget: Target = focusVersion ? target : "new";
+  const effectiveTarget: Target =
+    target === "refine" && focusVersion
+      ? "refine"
+      : target === "markup" && focusItem
+        ? "markup"
+        : "new";
   const isRefine = effectiveTarget === "refine" && focusVersion !== undefined;
+  const isMarkup = effectiveTarget === "markup" && focusItem !== undefined;
+  const markupStrokes =
+    isMarkup && markup.itemId === focusItem.id ? markup.strokes : [];
+  const setMarkupStrokes = (strokes: MarkupStroke[]) => {
+    if (focusItem) {
+      setMarkup({ itemId: focusItem.id, strokes });
+    }
+  };
 
   const presetPrompt = promptForPreset(restorePreset, removeArtifacts);
-  const activePrompt = isRefine
-    ? refinePrompt
-    : mode === "restore"
-      ? restorePrompt
-      : generatePrompt;
-  const setActivePrompt = isRefine
-    ? setRefinePrompt
-    : mode === "restore"
-      ? setRestorePrompt
-      : setGeneratePrompt;
-  const needsSource = mode === "restore" && !isRefine && !selectedFile;
-  const canSubmit = !isProcessing && !needsSource && activePrompt.trim() !== "";
+  const activePrompt = isMarkup
+    ? markupPrompt
+    : isRefine
+      ? refinePrompt
+      : mode === "restore"
+        ? restorePrompt
+        : generatePrompt;
+  const setActivePrompt = isMarkup
+    ? setMarkupPrompt
+    : isRefine
+      ? setRefinePrompt
+      : mode === "restore"
+        ? setRestorePrompt
+        : setGeneratePrompt;
+  const isNewRestore = mode === "restore" && effectiveTarget === "new";
+  const needsSource = isNewRestore && !selectedFile;
+  const needsMarkup = isMarkup && markupStrokes.length === 0;
+  const canSubmit =
+    !isProcessing && !needsSource && !needsMarkup && activePrompt.trim() !== "";
+  const zoomEnabled =
+    isFullscreen && (view === "compare" || (view === "single" && !isMarkup));
+  const singleZoom = useZoomPan(
+    singleViewerRef,
+    zoom,
+    setZoom,
+    zoomEnabled && view === "single",
+  );
   const hasSession =
     selectedFile !== null || versions.length > 0 || imports.length > 0;
 
@@ -396,7 +513,20 @@ export default function Home() {
     setRestorePrompt(promptForPreset("restore", true));
     setGeneratePrompt("");
     setRefinePrompt("");
+    setMarkupPrompt("");
+    setMarkup({ itemId: "", strokes: [] });
+    setGridIds([]);
+    setGridPick(null);
     setError(null);
+  };
+
+  const changeTarget = (nextTarget: Target) => {
+    setTarget(nextTarget);
+    // Drawing needs the single view, on the image that is currently in focus.
+    if (nextTarget === "markup" && focusItem) {
+      setSelectedId(focusItem.id);
+      setView("single");
+    }
   };
 
   const selectGalleryItem = (id: string) => {
@@ -438,16 +568,26 @@ export default function Home() {
     }
   };
 
-  const handleSubmit = async (event?: SubmitEvent<HTMLFormElement>) => {
-    event?.preventDefault();
-
-    if (isProcessing) {
+  // Runs one request per variation, all at once. A single submit is a batch of one.
+  const submit = async (requested: Variation[]) => {
+    if (isProcessing || requested.length === 0) {
       return;
     }
 
-    const parent = isRefine ? focusVersion : undefined;
-    if (mode === "restore" && !parent && !selectedFile) {
+    // Apply the app-wide model version to every variation.
+    const variations = requested.map((variation) => ({
+      ...variation,
+      model: withGeneration(variation.model, generation),
+    }));
+
+    const parent = isRefine || isMarkup ? focusVersion : undefined;
+    if (needsSource) {
       setError({ message: "Choose a photograph to restore first." });
+      return;
+    }
+
+    if (needsMarkup) {
+      setError({ message: "Draw on the image to show what to change." });
       return;
     }
 
@@ -461,8 +601,73 @@ export default function Home() {
       return;
     }
 
+    // Markup edits, and refinements of earlier Image API edits, send the image
+    // itself to the Image API. Everything else continues through Responses.
+    const editItem =
+      isMarkup || (isRefine && focusVersion && !focusVersion.responseId)
+        ? focusItem
+        : undefined;
+    let editImage: File | undefined;
+    let markupImage: Blob | undefined;
+    let editDimensions: Dimensions | undefined;
+    if (editItem) {
+      let image: File;
+      try {
+        image =
+          editItem.kind === "original" && selectedFile
+            ? selectedFile
+            : await fetch(editItem.src)
+                .then((response) => response.blob())
+                .then(
+                  (blob) =>
+                    new File([blob], `${editItem.label}.${blob.type.split("/")[1] ?? "png"}`, {
+                      type: blob.type,
+                    }),
+                );
+        editDimensions =
+          dimensions[editItem.id] ?? (await readImageDimensions(image));
+      } catch {
+        setError({ message: "The image to edit could not be read." });
+        return;
+      }
+      editImage = image;
+
+      const problem = validateImageFile(editImage);
+      if (problem) {
+        setError({ message: problem });
+        return;
+      }
+
+      if (isMarkup) {
+        if (editDimensions.width * editDimensions.height > MAX_MARKUP_PIXELS) {
+          setError({
+            message: "This image is too large to mark up (16.7 megapixels max).",
+          });
+          return;
+        }
+
+        try {
+          markupImage = await renderMarkupPng(
+            markupStrokes,
+            editDimensions.width,
+            editDimensions.height,
+          );
+        } catch {
+          setError({ message: "The markup could not be prepared." });
+          return;
+        }
+      }
+    }
+
     let requestedSize: string = mode === "generate" ? generateSize : "auto";
-    if (mode === "restore" && restoreSize !== "auto") {
+    if (editItem) {
+      // Edits keep the image's shape: follow the restore size preset, or let
+      // the output match the input.
+      requestedSize =
+        mode === "restore" && restoreSize !== "auto" && editDimensions
+          ? outputSizeForPreset(restoreSize, editDimensions)
+          : "auto";
+    } else if (mode === "restore" && restoreSize !== "auto") {
       try {
         const sourceDimensions =
           dimensions[ORIGINAL_ID] ??
@@ -480,32 +685,47 @@ export default function Home() {
       }
     }
 
+    const isBatch = variations.length > 1;
     setIsProcessing(true);
     setElapsedSeconds(0);
+    setBatchProgress({ done: 0, total: variations.length });
     setError(null);
 
-    const formData = new FormData();
-    formData.append("mode", mode);
-    if (mode === "restore" && !parent && selectedFile) {
-      formData.append("image", selectedFile);
-    }
-    formData.append("prompt", promptText);
-    formData.append("model", model);
-    formData.append("size", requestedSize);
-    formData.append("quality", quality);
-    if (parent) {
-      formData.append("previousResponseId", parent.responseId);
-    }
-    referenceImages.forEach((referenceImage) => {
-      formData.append("referenceImage", referenceImage.file);
-    });
-
-    try {
-      const response = await fetch("/api/restore", {
-        method: "POST",
-        headers: apiKey ? { "x-openai-api-key": apiKey } : undefined,
-        body: formData,
+    const runVariation = async (settings: Variation): Promise<RestoreVersion> => {
+      const formData = new FormData();
+      formData.append("mode", mode);
+      if (editImage) {
+        formData.append("editImage", editImage);
+        if (markupImage) {
+          formData.append("markup", markupImage, "markup.png");
+        }
+      } else if (parent) {
+        formData.append("previousResponseId", parent.responseId);
+      } else if (mode === "restore" && selectedFile) {
+        formData.append("image", selectedFile);
+      }
+      formData.append("prompt", promptText);
+      formData.append("model", settings.model);
+      formData.append("size", requestedSize);
+      formData.append("quality", settings.quality);
+      formData.append("complexity", settings.complexity);
+      referenceImages.forEach((referenceImage) => {
+        formData.append("referenceImage", referenceImage.file);
       });
+
+      let response: Response;
+      try {
+        response = await fetch("/api/restore", {
+          method: "POST",
+          headers: apiKey ? { "x-openai-api-key": apiKey } : undefined,
+          body: formData,
+        });
+      } catch (networkError) {
+        throw new RestoreRequestError(
+          "The request could not reach the server.",
+          networkError instanceof Error ? networkError.name : undefined,
+        );
+      }
       const payload = (await response.json().catch(() => null)) as Record<
         string,
         unknown
@@ -524,66 +744,176 @@ export default function Home() {
         !payload ||
         typeof payload.imageDataUrl !== "string" ||
         !payload.imageDataUrl.startsWith("data:image/") ||
-        typeof payload.responseId !== "string"
+        (!editImage && typeof payload.responseId !== "string")
       ) {
         throw new RestoreRequestError(
           "The image service returned an invalid image response.",
         );
       }
 
-      const versionId = crypto.randomUUID();
-      const version: RestoreVersion = {
-        id: versionId,
-        label: `v${versions.length + 1}`,
+      const responseId = payload.responseId;
+      return {
+        id: crypto.randomUUID(),
+        // Numbered in the order results arrive; see below.
+        label: "",
         mode,
         imageDataUrl: payload.imageDataUrl,
         metadata: normalizeMetadata(payload.metadata, {
-          model,
+          model: settings.model,
           size: requestedSize,
-          quality,
+          quality: settings.quality,
         }),
         prompt: promptText,
-        responseId: payload.responseId,
+        responseId: typeof responseId === "string" ? responseId : "",
         parentVersionId: parent?.id ?? null,
         sourceName:
           mode === "restore"
-            ? (selectedFile?.name ?? parent?.sourceName ?? null)
+            ? (parent?.sourceName ??
+              (editItem && editItem.kind !== "original" ? null : selectedFile?.name) ??
+              null)
             : null,
       };
-      setVersions((current) => [...current, version]);
-      setSelectedId(versionId);
-      setComparison({ left: null, right: versionId });
-      setComparisonPosition(50);
-      setView(mode === "restore" || parent ? "compare" : "single");
-      if (parent) {
+    };
+
+    const results = await Promise.allSettled(
+      variations.map(async (settings) => {
+        const version = await runVariation(settings);
+        setVersions((current) => [
+          ...current,
+          { ...version, label: `v${current.length + 1}` },
+        ]);
+        setBatchProgress((current) => ({ ...current, done: current.done + 1 }));
+        return version;
+      }),
+    );
+
+    const created = results.flatMap((result) =>
+      result.status === "fulfilled" ? [result.value] : [],
+    );
+    const failures = results.flatMap((result, index) =>
+      result.status === "rejected"
+        ? [{ settings: variations[index], reason: result.reason as unknown }]
+        : [],
+    );
+
+    if (created.length > 0) {
+      const first = created[0];
+      setSelectedId(first.id);
+      if (isBatch) {
+        // Show the batch next to the image it started from.
+        const baseId =
+          editItem?.id ??
+          parent?.id ??
+          (mode === "restore" && previewUrl ? ORIGINAL_ID : undefined);
+        setGridIds([...(baseId ? [baseId] : []), ...created.map((version) => version.id)]);
+        setGridPick(null);
+        setView("grid");
+      } else {
+        setComparison({ left: editItem?.id ?? null, right: first.id });
+        setComparisonPosition(50);
+        setView(mode === "restore" || parent || editItem ? "compare" : "single");
+      }
+      if (isMarkup) {
+        setMarkupPrompt("");
+        setMarkup({ itemId: "", strokes: [] });
+      } else if (parent) {
         setRefinePrompt("");
       }
       clearReferenceImages();
-    } catch (requestError) {
-      if (requestError instanceof RestoreRequestError) {
-        setError({ message: requestError.message, detail: requestError.detail });
+    }
+
+    if (failures.length > 0) {
+      const describe = (reason: unknown) =>
+        reason instanceof RestoreRequestError
+          ? reason.message
+          : "The request could not reach the server.";
+      if (!isBatch) {
+        const reason = failures[0].reason;
+        setError({
+          message: describe(reason),
+          detail: reason instanceof RestoreRequestError ? reason.detail : undefined,
+        });
       } else {
         setError({
-          message: "The request could not reach the server.",
-          detail: requestError instanceof Error ? requestError.name : undefined,
+          message: `${failures.length} of ${variations.length} variations failed.`,
+          detail: failures
+            .map(({ settings, reason }) => `${settingsLabel(settings)}: ${describe(reason)}`)
+            .join(" · "),
         });
       }
-    } finally {
-      setIsProcessing(false);
     }
+
+    setIsProcessing(false);
   };
 
+  const handleSubmit = (event?: SubmitEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    void submit([{ model, quality, complexity }]);
+  };
+
+  const openBatch = () => {
+    // Start from the saved preset the first time the dialog opens.
+    if (!batchPresetLoadedRef.current) {
+      batchPresetLoadedRef.current = true;
+      setBatchRows(loadPreset());
+    }
+    setIsBatchOpen(true);
+  };
+
+  const estimateCost = (row: Variation): Cost | undefined => {
+    const costs = versions.flatMap((version) =>
+      version.metadata.model === withGeneration(row.model, generation) &&
+      version.metadata.quality === row.quality &&
+      version.metadata.cost
+        ? [version.metadata.cost.amountUsd]
+        : [],
+    );
+    return costs.length > 0
+      ? {
+          amountUsd: costs.reduce((sum, cost) => sum + cost, 0) / costs.length,
+          currency: "USD",
+        }
+      : undefined;
+  };
+
+  const pickGridItem = (id: string) => {
+    setSelectedId(id);
+    if (!gridPick || gridPick === id) {
+      setGridPick(gridPick === id ? null : id);
+      return;
+    }
+
+    setComparison({ left: gridPick, right: id });
+    setComparisonPosition(50);
+    setGridPick(null);
+    setView("compare");
+  };
+
+  const blockedReason = isProcessing
+    ? "Wait for the current request to finish."
+    : needsSource
+      ? "Choose a source photograph first."
+      : needsMarkup
+        ? "Draw on the image to mark what to change."
+        : activePrompt.trim() === ""
+          ? "Add a prompt first."
+          : null;
+
   const submitLabel = isProcessing
-    ? isRefine
-      ? `Refining ${focusVersion?.label}…`
-      : mode === "restore"
-        ? "Restoring…"
-        : "Generating…"
-    : isRefine
-      ? `Refine ${focusVersion?.label}`
-      : mode === "restore"
-        ? "Restore photograph"
-        : "Generate image";
+    ? isMarkup
+      ? `Editing ${focusItem?.label}…`
+      : isRefine
+        ? `Refining ${focusVersion?.label}…`
+        : mode === "restore"
+          ? "Restoring…"
+          : "Generating…"
+    : isMarkup
+      ? `Apply markup to ${focusItem?.label}`
+      : isRefine
+        ? `Refine ${focusVersion?.label}`
+        : mode === "restore"
+          ? "Restore photograph"
+          : "Generate image";
 
   const lineage: RestoreVersion[] = [];
   for (
@@ -593,6 +923,53 @@ export default function Home() {
   ) {
     lineage.unshift(version);
   }
+
+  const renderFilmstrip = (inStage: boolean) => (
+    <nav className={`filmstrip${inStage ? " filmstrip-stage" : ""}`} aria-label="Versions">
+      {gallery.map((item) => {
+        const isLeft = view === "compare" && item.id === compareLeft?.id;
+        const isRight = view === "compare" && item.id === compareRight?.id;
+        const isActive = view === "compare" ? isRight : item.id === selectedItem?.id;
+        const parent = item.version?.parentVersionId
+          ? versions.find((v) => v.id === item.version?.parentVersionId)
+          : undefined;
+
+        return (
+          <button
+            key={item.id}
+            type="button"
+            className={`film-tile${isActive ? " is-active" : ""}${isLeft ? " is-left" : ""}`}
+            onClick={() => selectGalleryItem(item.id)}
+            aria-pressed={isActive}
+          >
+            <span className="film-thumb">
+              <Image src={item.src} alt="" fill sizes="88px" unoptimized />
+              {isLeft || isRight ? (
+                <span className="film-side">{isLeft ? "L" : "R"}</span>
+              ) : null}
+            </span>
+            <span className="film-label">
+              {item.version ? (
+                <Icon
+                  name={item.version.mode === "restore" ? "restore" : "sparkle"}
+                  size={11}
+                />
+              ) : item.kind === "imported" ? (
+                <Icon name="image" size={11} />
+              ) : null}
+              {item.label}
+              {parent ? <small>← {parent.label}</small> : null}
+            </span>
+            {item.version ? (
+              <span className="film-settings">
+                {settingsLabel(item.version.metadata)}
+              </span>
+            ) : null}
+          </button>
+        );
+      })}
+    </nav>
+  );
 
   const renderSideSelect = (side: ComparisonSide, item: GalleryItem | undefined) => (
     <div className="side-picker">
@@ -769,21 +1146,33 @@ export default function Home() {
                 Instructions
               </h2>
 
-              {focusVersion ? (
+              {focusItem ? (
                 <Segmented
                   label="What to submit"
                   value={effectiveTarget}
-                  onChange={setTarget}
+                  onChange={changeTarget}
                   options={[
                     {
-                      value: "new",
+                      value: "new" as const,
                       label: mode === "restore" ? "New restoration" : "New image",
                     },
+                    ...(focusVersion
+                      ? [
+                          {
+                            value: "refine" as const,
+                            label: (
+                              <>
+                                <Icon name="pen" /> Refine {focusVersion.label}
+                              </>
+                            ),
+                          },
+                        ]
+                      : []),
                     {
-                      value: "refine",
+                      value: "markup" as const,
                       label: (
                         <>
-                          <Icon name="pen" /> Refine {focusVersion.label}
+                          <Icon name="brush" /> Mark up
                         </>
                       ),
                     },
@@ -791,7 +1180,71 @@ export default function Home() {
                 />
               ) : null}
 
-              {mode === "restore" && !isRefine ? (
+              {isMarkup ? (
+                <Field
+                  label={`Markup on ${focusItem.label}`}
+                  action={
+                    <span className="markup-actions">
+                      <button
+                        className="link-button"
+                        type="button"
+                        disabled={markupStrokes.length === 0}
+                        onClick={() => setMarkupStrokes(markupStrokes.slice(0, -1))}
+                      >
+                        Undo
+                      </button>
+                      <button
+                        className="link-button"
+                        type="button"
+                        disabled={markupStrokes.length === 0}
+                        onClick={() => setMarkupStrokes([])}
+                      >
+                        Clear
+                      </button>
+                    </span>
+                  }
+                  hint={
+                    view === "single" ? (
+                      "Draw on the image to show where the change goes. Circle or outline the area, then describe the change below."
+                    ) : (
+                      <button
+                        className="link-button"
+                        type="button"
+                        onClick={() => changeTarget("markup")}
+                      >
+                        Switch to single view to draw
+                      </button>
+                    )
+                  }
+                >
+                  <div className="markup-tools">
+                    <div className="swatches" role="radiogroup" aria-label="Markup color">
+                      {MARKUP_COLORS.map(([color, name]) => (
+                        <button
+                          key={color}
+                          type="button"
+                          role="radio"
+                          aria-checked={markupColor === color}
+                          aria-label={name}
+                          title={name}
+                          className={`swatch${markupColor === color ? " is-active" : ""}`}
+                          style={{ background: color }}
+                          onClick={() => setMarkupColor(color)}
+                        />
+                      ))}
+                    </div>
+                    <Segmented
+                      label="Brush size"
+                      size="sm"
+                      value={brushSize}
+                      onChange={setBrushSize}
+                      options={BRUSH_SIZES.map(([value, label]) => ({ value, label }))}
+                    />
+                  </div>
+                </Field>
+              ) : null}
+
+              {isNewRestore ? (
                 <div className="preset-row">
                   <Segmented
                     label="Prompt preset"
@@ -820,15 +1273,17 @@ export default function Home() {
 
               <Field
                 label={
-                  isRefine
-                    ? "Refinement"
-                    : mode === "restore"
+                  isMarkup
+                    ? "What to change"
+                    : isRefine
+                      ? "Refinement"
+                      : mode === "restore"
                       ? "Restoration prompt"
                       : "Prompt"
                 }
                 htmlFor="prompt"
                 action={
-                  mode === "restore" && !isRefine && restorePrompt !== presetPrompt ? (
+                  isNewRestore && restorePrompt !== presetPrompt ? (
                     <button
                       className="link-button"
                       type="button"
@@ -841,8 +1296,8 @@ export default function Home() {
                 hint={
                   <>
                     <span>
-                      {isRefine
-                        ? `Builds on ${focusVersion?.label} and becomes v${versions.length + 1}.`
+                      {isMarkup || isRefine
+                        ? `Edits ${focusItem?.label} and becomes v${versions.length + 1}.`
                         : "Ctrl + Enter to submit"}
                     </span>
                     <span>
@@ -858,9 +1313,11 @@ export default function Home() {
                   maxLength={MAX_PROMPT_LENGTH}
                   rows={6}
                   placeholder={
-                    isRefine
-                      ? `Describe what to change in ${focusVersion?.label}…`
-                      : "Describe the image you want to create…"
+                    isMarkup
+                      ? "e.g. Repair the tear inside the red outline so it blends with the sky."
+                      : isRefine
+                        ? `Describe what to change in ${focusVersion?.label}…`
+                        : "Describe the image you want to create…"
                   }
                   onChange={(event) => setActivePrompt(event.target.value)}
                   onKeyDown={(event) => {
@@ -951,7 +1408,21 @@ export default function Home() {
               <h2 className="section-kicker" id="output-title">
                 Output
               </h2>
-              <Field label="Model">
+              <Field
+                label="Model"
+                action={
+                  <Segmented
+                    label="Model version"
+                    size="sm"
+                    value={generation}
+                    onChange={saveModelGeneration}
+                    options={MODEL_GENERATIONS.map((value) => ({
+                      value,
+                      label: value,
+                    }))}
+                  />
+                }
+              >
                 <Segmented
                   label="Model"
                   value={model}
@@ -963,42 +1434,42 @@ export default function Home() {
                   }))}
                 />
               </Field>
+              <Field label="Size" htmlFor="size">
+                {mode === "restore" ? (
+                  <select
+                    id="size"
+                    value={restoreSize}
+                    onChange={(event) => {
+                      if (isRestoreSizePreset(event.target.value)) {
+                        setRestoreSize(event.target.value);
+                      }
+                    }}
+                  >
+                    {RESTORE_SIZE_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <select
+                    id="size"
+                    value={generateSize}
+                    onChange={(event) => {
+                      if (isGenerateSizePreset(event.target.value)) {
+                        setGenerateSize(event.target.value);
+                      }
+                    }}
+                  >
+                    {GENERATE_SIZE_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </Field>
               <div className="field-row">
-                <Field label="Size" htmlFor="size">
-                  {mode === "restore" ? (
-                    <select
-                      id="size"
-                      value={restoreSize}
-                      onChange={(event) => {
-                        if (isRestoreSizePreset(event.target.value)) {
-                          setRestoreSize(event.target.value);
-                        }
-                      }}
-                    >
-                      {RESTORE_SIZE_OPTIONS.map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <select
-                      id="size"
-                      value={generateSize}
-                      onChange={(event) => {
-                        if (isGenerateSizePreset(event.target.value)) {
-                          setGenerateSize(event.target.value);
-                        }
-                      }}
-                    >
-                      {GENERATE_SIZE_OPTIONS.map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </Field>
                 <Field label="Quality" htmlFor="quality">
                   <select
                     id="quality"
@@ -1012,24 +1483,60 @@ export default function Home() {
                     ))}
                   </select>
                 </Field>
+                <Field label="Complexity" htmlFor="complexity">
+                  <select
+                    id="complexity"
+                    value={complexity}
+                    onChange={(event) => setComplexity(event.target.value)}
+                  >
+                    {COMPLEXITY_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
               </div>
             </section>
           </div>
 
           <div className="composer-footer">
+            <div className="submit-row">
             <button className="primary-button" type="submit" disabled={!canSubmit}>
               {isProcessing ? (
                 <span className="spinner" aria-hidden="true" />
               ) : (
-                <Icon name={isRefine ? "pen" : mode === "restore" ? "restore" : "sparkle"} />
+                <Icon
+                  name={
+                    isMarkup
+                      ? "brush"
+                      : isRefine
+                        ? "pen"
+                        : mode === "restore"
+                          ? "restore"
+                          : "sparkle"
+                  }
+                />
               )}
               <span>{submitLabel}</span>
             </button>
+            <button
+              className="secondary-button batch-button"
+              type="button"
+              onClick={openBatch}
+              disabled={isProcessing}
+              title="Run several model and quality combinations at once"
+            >
+              <Icon name="layers" /> Batch
+            </button>
+            </div>
             <p className="processing-note" aria-live="polite">
               {isProcessing
-                ? `${elapsedSeconds}s elapsed · can take up to about two minutes`
+                ? `${batchProgress.total > 1 ? `${batchProgress.done}/${batchProgress.total} done · ` : ""}${elapsedSeconds}s elapsed · can take up to about two minutes`
                 : needsSource
                   ? "Choose a source photograph to begin."
+                  : needsMarkup
+                    ? "Draw on the image to mark what to change."
                   : "One request at a time. Nothing is retried automatically."}
             </p>
           </div>
@@ -1064,6 +1571,14 @@ export default function Home() {
                       </>
                     ),
                   },
+                  {
+                    value: "grid",
+                    label: (
+                      <>
+                        <Icon name="grid" /> Grid
+                      </>
+                    ),
+                  },
                 ]}
               />
 
@@ -1082,6 +1597,14 @@ export default function Home() {
                   </button>
                   {renderSideSelect("right", compareRight)}
                 </div>
+              ) : view === "grid" ? (
+                <div className="stage-title">
+                  <span>
+                    {gridPick
+                      ? `Pick a second image to compare with ${findItem(gridPick)?.label}`
+                      : "Pick two images to compare them"}
+                  </span>
+                </div>
               ) : (
                 <div className="stage-title">
                   {selectedItem ? (
@@ -1094,6 +1617,51 @@ export default function Home() {
               )}
 
               <div className="stage-actions">
+                {isFullscreen && zoomEnabled ? (
+                  <div className="zoom-controls" role="group" aria-label="Zoom">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => zoomBy(1 / 1.5)}
+                      disabled={zoom.scale <= 1}
+                      aria-label="Zoom out"
+                      title="Zoom out (−)"
+                    >
+                      <Icon name="minus" />
+                    </button>
+                    <button
+                      className="zoom-level"
+                      type="button"
+                      onClick={() => setZoom(NO_ZOOM)}
+                      disabled={zoom.scale <= 1}
+                      title="Fit to screen (0)"
+                    >
+                      {zoom.scale <= 1 ? "Fit" : `${Math.round(zoom.scale * 100)}%`}
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => zoomBy(1.5)}
+                      disabled={zoom.scale >= MAX_ZOOM}
+                      aria-label="Zoom in"
+                      title="Zoom in (+)"
+                    >
+                      <Icon name="plus" />
+                    </button>
+                  </div>
+                ) : null}
+                {isFullscreen && gallery.length > 0 ? (
+                  <button
+                    className={`icon-button${showFullscreenFilmstrip ? " is-on" : ""}`}
+                    type="button"
+                    onClick={() => setShowFullscreenFilmstrip((current) => !current)}
+                    aria-pressed={showFullscreenFilmstrip}
+                    aria-label="Show filmstrip"
+                    title={showFullscreenFilmstrip ? "Hide filmstrip" : "Show filmstrip"}
+                  >
+                    <Icon name="filmstrip" />
+                  </button>
+                ) : null}
                 {focusVersion ? (
                   <a
                     className="secondary-button"
@@ -1115,7 +1683,7 @@ export default function Home() {
               </div>
             </div>
 
-            <div className="stage-body">
+            <div className="stage-body" ref={stageBodyRef}>
               {view === "compare" ? (
                 <ComparisonViewer
                   left={compareLeft}
@@ -1124,19 +1692,55 @@ export default function Home() {
                   onPositionChange={setComparisonPosition}
                   onDropFile={importImage}
                   onImageLoad={recordDimensions}
+                  zoom={zoom}
+                  onZoomChange={setZoom}
+                  zoomEnabled={zoomEnabled}
+                />
+              ) : view === "grid" && gridItems.length > 0 ? (
+                <GridViewer
+                  items={gridItems}
+                  pickedId={gridPick}
+                  onPick={pickGridItem}
+                  onImageLoad={recordDimensions}
+                />
+              ) : selectedItem && isMarkup ? (
+                <MarkupCanvas
+                  key={selectedItem.id}
+                  src={selectedItem.src}
+                  alt={selectedItem.label}
+                  strokes={markupStrokes}
+                  color={markupColor}
+                  strokeWidth={({ width, height }) => brushWidth(brushSize, width, height)}
+                  onStrokesChange={setMarkupStrokes}
+                  onImageLoad={(event) => recordDimensions(selectedItem.id, event)}
                 />
               ) : selectedItem ? (
-                <div className="single-viewer">
-                  <Image
-                    key={selectedItem.id}
-                    className="stage-image"
-                    src={selectedItem.src}
-                    alt={selectedItem.label}
-                    fill
-                    sizes="(max-width: 900px) 100vw, 1100px"
-                    unoptimized
-                    onLoad={(event) => recordDimensions(selectedItem.id, event)}
-                  />
+                <div
+                  ref={singleViewerRef}
+                  className={`single-viewer${zoomEnabled ? " is-zoomable" : ""}${zoom.scale > 1 ? " is-zoomed" : ""}`}
+                  onPointerDown={(event) => {
+                    singleZoom.onPointerDown(event);
+                  }}
+                  onPointerMove={(event) => {
+                    singleZoom.onPointerMove(event);
+                  }}
+                  onPointerUp={singleZoom.onPointerUp}
+                  onPointerCancel={singleZoom.onPointerUp}
+                  onDoubleClick={singleZoom.onDoubleClick}
+                >
+                  <div className="zoom-layer" style={{ transform: zoomTransform(zoom) }}>
+                    <Image
+                      key={selectedItem.id}
+                      className="stage-image"
+                      src={selectedItem.src}
+                      alt={selectedItem.label}
+                      fill
+                      sizes="(max-width: 900px) 100vw, 1100px"
+                      unoptimized
+                      draggable={false}
+                      onLoad={(event) => recordDimensions(selectedItem.id, event)}
+                    />
+                  </div>
                 </div>
               ) : mode === "restore" ? (
                 <label
@@ -1172,19 +1776,33 @@ export default function Home() {
                 <div className="stage-progress" role="status">
                   <span className="spinner spinner-lg" aria-hidden="true" />
                   <strong>
-                    {isRefine
-                      ? `Refining ${focusVersion?.label}`
-                      : mode === "restore"
-                        ? "Restoring photograph"
-                        : "Generating image"}
+                    {isMarkup
+                      ? `Applying markup to ${focusItem?.label}`
+                      : isRefine
+                        ? `Refining ${focusVersion?.label}`
+                        : mode === "restore"
+                          ? "Restoring photograph"
+                          : "Generating image"}
                   </strong>
-                  <span>{elapsedSeconds}s</span>
+                  <span>
+                    {batchProgress.total > 1
+                      ? `${batchProgress.done} of ${batchProgress.total} done · `
+                      : ""}
+                    {elapsedSeconds}s
+                  </span>
                 </div>
               ) : null}
             </div>
 
-            {view === "compare" && isFullscreen ? (
-              <p className="stage-hint">← left · ↑ center · → right</p>
+            {isFullscreen && showFullscreenFilmstrip && gallery.length > 0
+              ? renderFilmstrip(true)
+              : null}
+
+            {isFullscreen && zoomEnabled ? (
+              <p className="stage-hint">
+                Scroll or pinch to zoom · drag to pan · double-click to toggle · 0 to fit
+                {view === "compare" ? " · ← left · ↑ center · → right" : ""}
+              </p>
             ) : null}
           </section>
 
@@ -1205,47 +1823,7 @@ export default function Home() {
             </div>
           ) : null}
 
-          {gallery.length > 0 ? (
-            <nav className="filmstrip" aria-label="Versions">
-              {gallery.map((item) => {
-                const isLeft = view === "compare" && item.id === compareLeft?.id;
-                const isRight = view === "compare" && item.id === compareRight?.id;
-                const isActive = view === "single" ? item.id === selectedItem?.id : isRight;
-                const parent = item.version?.parentVersionId
-                  ? versions.find((v) => v.id === item.version?.parentVersionId)
-                  : undefined;
-
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className={`film-tile${isActive ? " is-active" : ""}${isLeft ? " is-left" : ""}`}
-                    onClick={() => selectGalleryItem(item.id)}
-                    aria-pressed={isActive}
-                  >
-                    <span className="film-thumb">
-                      <Image src={item.src} alt="" fill sizes="88px" unoptimized />
-                      {isLeft || isRight ? (
-                        <span className="film-side">{isLeft ? "L" : "R"}</span>
-                      ) : null}
-                    </span>
-                    <span className="film-label">
-                      {item.version ? (
-                        <Icon
-                          name={item.version.mode === "restore" ? "restore" : "sparkle"}
-                          size={11}
-                        />
-                      ) : item.kind === "imported" ? (
-                        <Icon name="image" size={11} />
-                      ) : null}
-                      {item.label}
-                      {parent ? <small>← {parent.label}</small> : null}
-                    </span>
-                  </button>
-                );
-              })}
-            </nav>
-          ) : null}
+          {gallery.length > 0 ? renderFilmstrip(false) : null}
 
           {focusVersion ? (
             <section className="details" aria-label={`${focusVersion.label} details`}>
@@ -1253,7 +1831,9 @@ export default function Home() {
                 <h2>
                   {focusVersion.label}
                   <span>
-                    {focusVersion.parentVersionId
+                    {focusVersion.metadata.markup
+                      ? `Markup edit of ${versions.find((v) => v.id === focusVersion.parentVersionId)?.label ?? "an image"}`
+                      : focusVersion.parentVersionId
                       ? `Refinement of ${versions.find((v) => v.id === focusVersion.parentVersionId)?.label ?? "an earlier version"}`
                       : focusVersion.mode === "restore"
                         ? `Restoration${focusVersion.sourceName ? ` of ${focusVersion.sourceName}` : ""}`
@@ -1269,6 +1849,10 @@ export default function Home() {
                 <div>
                   <dt>Quality</dt>
                   <dd>{focusVersion.metadata.quality}</dd>
+                </div>
+                <div>
+                  <dt>Complexity</dt>
+                  <dd>{focusVersion.metadata.complexity ?? "auto"}</dd>
                 </div>
                 <div>
                   <dt>Requested</dt>
@@ -1334,6 +1918,19 @@ export default function Home() {
           ) : null}
         </main>
       </div>
+
+      {isBatchOpen ? (
+        <BatchDialog
+          rows={batchRows}
+          onRowsChange={setBatchRows}
+          estimate={estimateCost}
+          generation={generation}
+          actionLabel={submitLabel}
+          blockedReason={blockedReason}
+          onRun={() => void submit(batchRows)}
+          onClose={() => setIsBatchOpen(false)}
+        />
+      ) : null}
 
       <input
         ref={importInputRef}
