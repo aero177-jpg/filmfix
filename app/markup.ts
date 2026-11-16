@@ -54,20 +54,23 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: MarkupStroke) 
   ctx.stroke();
 }
 
-// Renders the strokes onto a transparent PNG the same size as the image.
+// Renders the strokes onto a transparent PNG the same size as the image. Pass
+// `output` when the image was resized for upload so the layer still lines up.
 export function renderMarkupPng(
   strokes: MarkupStroke[],
   width: number,
   height: number,
+  output: { width: number; height: number } = { width, height },
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = output.width;
+  canvas.height = output.height;
   const ctx = canvas.getContext("2d");
   if (!ctx) {
     return Promise.reject(new Error("Canvas is not available."));
   }
 
+  ctx.scale(output.width / width, output.height / height);
   strokes.forEach((stroke) => drawStroke(ctx, stroke));
 
   return new Promise((resolve, reject) => {

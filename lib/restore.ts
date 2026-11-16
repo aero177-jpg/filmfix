@@ -85,6 +85,52 @@ export class MalformedImageResponseError extends Error {
   }
 }
 
+// OpenAI doesn't publish a list of refusal reasons. Safety blocks arrive with
+// codes such as "moderation_blocked", so match the family rather than an exact list.
+export function isSafetyCode(code: string | undefined): boolean {
+  return Boolean(code && /moderation|policy|safety|content_filter/i.test(code));
+}
+
+export const SAFETY_BLOCK_MESSAGE =
+  "OpenAI's safety system blocked this request. It can be set off by wording in the prompt or by something in the image itself. Try rephrasing the prompt, removing a reference image, or using a different photo.";
+
+function truncate(text: string, length: number): string {
+  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+}
+
+// Explains a Responses API result that came back without an image.
+function describeMissingImage(response: OpenAI.Responses.Response, fallback: string): string {
+  const errorCode = response.error?.code;
+  if (isSafetyCode(errorCode)) {
+    return SAFETY_BLOCK_MESSAGE;
+  }
+  if (response.error?.message) {
+    return `OpenAI could not create the image: ${truncate(response.error.message, 300)}`;
+  }
+
+  const incompleteReason = response.incomplete_details?.reason;
+  if (incompleteReason === "content_filter") {
+    return SAFETY_BLOCK_MESSAGE;
+  }
+
+  // When the model declines it usually says why in plain text instead of
+  // calling the image tool.
+  const reply = response.output_text?.trim();
+  if (reply) {
+    return `The model didn't create an image. It replied: "${truncate(reply, 400)}"`;
+  }
+
+  if (
+    response.output.some(
+      (item) => item.type === "image_generation_call" && item.status === "failed",
+    )
+  ) {
+    return "Image generation failed on OpenAI's side. This is often a safety block; try rephrasing the prompt or using a different image.";
+  }
+
+  return fallback;
+}
+
 function isSupportedValue<T extends string>(
   values: readonly T[],
   value: string,
@@ -302,9 +348,11 @@ function imageDataUrl(image: { bytes: Buffer; type: string }): string {
   return `data:${image.type};base64,${image.bytes.toString("base64")}`;
 }
 
-export async function restoreImage(
-  request: RestoreImageRequest,
-): Promise<RestoreImageResult> {
+// Restore, generate and refine run as OpenAI background jobs. Netlify stops
+// functions after 60 seconds, which large or high-quality images can exceed,
+// so the route only starts the job and the browser polls for the result.
+// Returns the response id to poll.
+export async function startRestoreJob(request: RestoreImageRequest): Promise<string> {
   const openai = new OpenAI({
     apiKey: request.apiKey,
     maxRetries: 0,
@@ -375,7 +423,40 @@ export async function restoreImage(
       },
     ],
     tool_choice: "required",
+    background: true,
+    // Background results are only kept past ~10 minutes when stored, and
+    // refinements continue from this response id.
+    store: true,
   });
+
+  return response.id;
+}
+
+export type RestoreJobState =
+  | { done: false; status: "queued" | "in_progress" }
+  | { done: true; result: RestoreImageResult };
+
+export async function getRestoreJob(apiKey: string, responseId: string): Promise<RestoreJobState> {
+  const openai = new OpenAI({ apiKey, maxRetries: 1 });
+  const response = await openai.responses.retrieve(responseId);
+
+  if (response.status === "queued" || response.status === "in_progress") {
+    return { done: false, status: response.status };
+  }
+
+  if (response.status === "cancelled") {
+    throw new MalformedImageResponseError("The image job was cancelled.");
+  }
+
+  return { done: true, result: imageResultFromResponse(response) };
+}
+
+export async function cancelRestoreJob(apiKey: string, responseId: string): Promise<void> {
+  const openai = new OpenAI({ apiKey, maxRetries: 0 });
+  await openai.responses.cancel(responseId);
+}
+
+function imageResultFromResponse(response: OpenAI.Responses.Response): RestoreImageResult {
   const imageGeneration = response.output.find(
     (item) => item.type === "image_generation_call" && item.result,
   );
@@ -386,7 +467,10 @@ export async function restoreImage(
 
   if (!base64) {
     throw new MalformedImageResponseError(
-      "The image service did not produce a usable image. Try refining again or use a different reference image.",
+      describeMissingImage(
+        response,
+        "The image service did not produce a usable image. Try refining again or use a different reference image.",
+      ),
     );
   }
 

@@ -2,16 +2,62 @@ import { NextResponse } from "next/server";
 
 import {
   MalformedImageResponseError,
+  SAFETY_BLOCK_MESSAGE,
+  cancelRestoreJob,
   editImage,
-  restoreImage,
+  getRestoreJob,
+  isSafetyCode,
+  startRestoreJob,
   validateEditInput,
   validateRestoreInput,
-  type RestoreImageResult,
 } from "@/lib/restore";
 
 export const runtime = "nodejs";
 
 const outputFormat = "png";
+
+// Netlify caps buffered function responses at 6 MB, and a large PNG as base64
+// can exceed that. Streamed responses are allowed up to 20 MB.
+function streamJson(body: unknown, status = 200): Response {
+  const bytes = new TextEncoder().encode(JSON.stringify(body));
+  const chunkSize = 256 * 1024;
+  let offset = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(bytes.subarray(offset, offset + chunkSize));
+      offset += chunkSize;
+    },
+  });
+
+  return new Response(stream, {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function getOpenAIErrorDetails(error: unknown): { code?: string; message?: string } {
+  if (typeof error !== "object" || error === null) {
+    return {};
+  }
+
+  const { code, error: body } = error as {
+    code?: unknown;
+    error?: { code?: unknown; message?: unknown } | null;
+  };
+  return {
+    code:
+      typeof code === "string"
+        ? code
+        : typeof body?.code === "string"
+          ? body.code
+          : undefined,
+    message: typeof body?.message === "string" ? body.message : undefined,
+  };
+}
 
 function getErrorStatus(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null || !("status" in error)) {
@@ -26,8 +72,13 @@ function getErrorName(error: unknown): string | undefined {
   return error instanceof Error ? error.name : undefined;
 }
 
-function openAIErrorResponse(error: unknown) {
+function openAIErrorResponse(error: unknown): { status: number; message: string; code?: string } {
   const status = getErrorStatus(error);
+  const { code, message } = getOpenAIErrorDetails(error);
+
+  if (isSafetyCode(code)) {
+    return { status: 400, message: SAFETY_BLOCK_MESSAGE, code };
+  }
 
   if (status === 401 || status === 403) {
     return {
@@ -44,9 +95,14 @@ function openAIErrorResponse(error: unknown) {
   }
 
   if (status === 400 || status === 422) {
+    // OpenAI's own wording for 400s ("Invalid size", "image too large", ...)
+    // is more useful than a generic line.
     return {
       status: 400,
-      message: "OpenAI rejected the image, prompt, or settings.",
+      message: message
+        ? `OpenAI rejected the request: ${message}`
+        : "OpenAI rejected the image, prompt, or settings.",
+      code,
     };
   }
 
@@ -63,16 +119,19 @@ function openAIErrorResponse(error: unknown) {
   };
 }
 
-function errorPayload(message: string, error?: unknown) {
+function errorPayload(message: string, error?: unknown, code?: string) {
   const technicalDetail =
     process.env.NODE_ENV === "development" ? getErrorName(error) : undefined;
 
-  return technicalDetail ? { error: message, detail: technicalDetail } : { error: message };
+  return {
+    error: message,
+    ...(code && { code }),
+    ...(technicalDetail && { detail: technicalDetail }),
+  };
 }
 
-export async function POST(request: Request) {
-  const startedAt = Date.now();
-
+// Returns the key to use, or an error response to send back.
+function resolveApiKey(request: Request): string | Response {
   // A key entered in the browser takes precedence over the server's own key.
   const headerKey = request.headers.get("x-openai-api-key")?.trim();
   if (headerKey && !/^sk-[A-Za-z0-9_-]{16,400}$/.test(headerKey)) {
@@ -88,6 +147,88 @@ export async function POST(request: Request) {
       errorPayload("No API key. Add one with the key icon, or set OPENAI_API_KEY on the server."),
       { status: 503 },
     );
+  }
+
+  return apiKey;
+}
+
+function readJobId(request: Request): string | undefined {
+  const id = new URL(request.url).searchParams.get("id")?.trim();
+  return id && id.length <= 256 && /^[A-Za-z0-9_-]+$/.test(id) ? id : undefined;
+}
+
+function openAIErrorJson(error: unknown): Response {
+  if (error instanceof MalformedImageResponseError) {
+    return NextResponse.json(errorPayload(error.message, error), { status: 502 });
+  }
+
+  const mappedError = openAIErrorResponse(error);
+  return NextResponse.json(errorPayload(mappedError.message, error, mappedError.code), {
+    status: mappedError.status,
+  });
+}
+
+// Polls a background job started by POST. Answers { status } while it runs,
+// then the finished image.
+export async function GET(request: Request) {
+  const apiKey = resolveApiKey(request);
+  if (typeof apiKey !== "string") {
+    return apiKey;
+  }
+
+  const id = readJobId(request);
+  if (!id) {
+    return NextResponse.json(errorPayload("The image job id is missing or invalid."), {
+      status: 400,
+    });
+  }
+
+  try {
+    const job = await getRestoreJob(apiKey, id);
+    if (!job.done) {
+      return NextResponse.json({ status: job.status });
+    }
+
+    return streamJson({
+      status: "completed",
+      imageDataUrl: job.result.dataUrl,
+      responseId: job.result.responseId,
+      usage: job.result.usage,
+      cost: job.result.cost,
+    });
+  } catch (error) {
+    return openAIErrorJson(error);
+  }
+}
+
+// Cancels a background job the browser has given up on, so it stops costing money.
+export async function DELETE(request: Request) {
+  const apiKey = resolveApiKey(request);
+  if (typeof apiKey !== "string") {
+    return apiKey;
+  }
+
+  const id = readJobId(request);
+  if (!id) {
+    return NextResponse.json(errorPayload("The image job id is missing or invalid."), {
+      status: 400,
+    });
+  }
+
+  try {
+    await cancelRestoreJob(apiKey, id);
+    return new Response(null, { status: 204 });
+  } catch (error) {
+    return openAIErrorJson(error);
+  }
+}
+
+export async function POST(request: Request) {
+  const startedAt = Date.now();
+
+  const apiKey = resolveApiKey(request);
+  if (typeof apiKey !== "string") {
+    return apiKey;
   }
 
   let formData: FormData;
@@ -142,9 +283,6 @@ export async function POST(request: Request) {
     imageSize: file.size,
   }));
 
-  let result: RestoreImageResult;
-  let settings: { model: string; size: string; quality: string; complexity: string };
-
   try {
     if (editImageFile) {
       // A direct Image API edit, optionally guided by a drawn markup layer.
@@ -165,8 +303,10 @@ export async function POST(request: Request) {
         });
       }
 
-      settings = validation.value;
-      result = await editImage({
+      // The Image API has no background mode, so edits still have to finish
+      // within the host's 60 second function limit.
+      const settings = validation.value;
+      const result = await editImage({
         apiKey,
         image: {
           bytes: await readFile(editImageFile),
@@ -181,6 +321,22 @@ export async function POST(request: Request) {
           })),
         ),
         ...validation.value,
+      });
+
+      return streamJson({
+        imageDataUrl: result.dataUrl,
+        metadata: {
+          mode: mode === "generate" ? "generate" : "restore",
+          model: settings.model,
+          size: settings.size,
+          quality: settings.quality,
+          complexity: settings.complexity,
+          markup: Boolean(markup),
+          outputFormat,
+          durationMs: Date.now() - startedAt,
+          usage: result.usage,
+          cost: result.cost,
+        },
       });
     } else {
       // Generate mode never sends a source photograph, even if one was attached.
@@ -205,8 +361,8 @@ export async function POST(request: Request) {
         });
       }
 
-      settings = validation.value;
-      result = await restoreImage({
+      const settings = validation.value;
+      const jobId = await startRestoreJob({
         apiKey,
         image: sourceImage
           ? {
@@ -223,34 +379,26 @@ export async function POST(request: Request) {
         ),
         ...validation.value,
       });
-    }
 
-    return NextResponse.json({
-      imageDataUrl: result.dataUrl,
-      responseId: result.responseId,
-      metadata: {
-        mode: mode === "generate" ? "generate" : "restore",
-        model: settings.model,
-        size: settings.size,
-        quality: settings.quality,
-        complexity: settings.complexity,
-        markup: Boolean(editImageFile && markup),
-        outputFormat,
-        durationMs: Date.now() - startedAt,
-        usage: result.usage,
-        cost: result.cost,
-      },
-    });
+      // The browser polls GET ?id=jobId for the image. Usage, cost and duration
+      // are filled in when it finishes.
+      return NextResponse.json(
+        {
+          jobId,
+          metadata: {
+            mode: settings.mode,
+            model: settings.model,
+            size: settings.size,
+            quality: settings.quality,
+            complexity: settings.complexity,
+            markup: false,
+            outputFormat,
+          },
+        },
+        { status: 202 },
+      );
+    }
   } catch (error) {
-    if (error instanceof MalformedImageResponseError) {
-      return NextResponse.json(errorPayload(error.message, error), {
-        status: 502,
-      });
-    }
-
-    const mappedError = openAIErrorResponse(error);
-    return NextResponse.json(errorPayload(mappedError.message, error), {
-      status: mappedError.status,
-    });
+    return openAIErrorJson(error);
   }
 }

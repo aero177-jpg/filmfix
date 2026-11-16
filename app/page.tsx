@@ -73,6 +73,7 @@ import {
   type RestoreVersion,
   type Target,
 } from "./studio";
+import { fitUploads } from "./upload";
 
 const ORIGINAL_ID = "original";
 
@@ -97,6 +98,89 @@ class RestoreRequestError extends Error {
     this.name = "RestoreRequestError";
     this.detail = detail;
   }
+}
+
+// For replies that aren't our JSON, usually the hosting platform cutting the
+// request off before or during the route.
+function describeHttpFailure(status: number): string {
+  // Netlify stops functions after 60 seconds.
+  if (status === 504 || status === 502 || status === 408) {
+    return "The image took longer than the server's 60 second limit. Try a lower quality or a smaller output size.";
+  }
+  if (status === 413) {
+    return "The upload was too large for the server. Try a smaller image or fewer reference images.";
+  }
+  return `The server returned an unexpected error (HTTP ${status}). Please try again.`;
+}
+
+type JsonPayload = Record<string, unknown>;
+
+function isRecord(value: unknown): value is JsonPayload {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function readJsonPayload(response: Response): Promise<JsonPayload | null> {
+  const value: unknown = await response.json().catch(() => null);
+  return isRecord(value) ? value : null;
+}
+
+function requestErrorFrom(response: Response, payload: JsonPayload | null) {
+  return new RestoreRequestError(
+    typeof payload?.error === "string" ? payload.error : describeHttpFailure(response.status),
+    typeof payload?.detail === "string" ? payload.detail : undefined,
+  );
+}
+
+const POLL_INTERVAL_MS = 3_000;
+// OpenAI occasionally leaves background jobs queued indefinitely; give up and
+// cancel rather than spin forever.
+const JOB_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_POLL_NETWORK_FAILURES = 4;
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Polls a background image job until it finishes. Each poll is a short
+// request, so none of them come near the host's function time limit.
+async function waitForImageJob(
+  jobId: string,
+  headers: Record<string, string> | undefined,
+): Promise<JsonPayload> {
+  const url = `/api/restore?id=${encodeURIComponent(jobId)}`;
+  const deadline = Date.now() + JOB_TIMEOUT_MS;
+  let networkFailures = 0;
+
+  while (Date.now() < deadline) {
+    await delay(POLL_INTERVAL_MS);
+
+    let response: Response;
+    try {
+      response = await fetch(url, { headers, cache: "no-store" });
+    } catch {
+      // A dropped connection mid-job isn't fatal; the job keeps running.
+      networkFailures += 1;
+      if (networkFailures >= MAX_POLL_NETWORK_FAILURES) {
+        throw new RestoreRequestError("Lost contact with the server while the image was being made.");
+      }
+      continue;
+    }
+    networkFailures = 0;
+
+    const payload = await readJsonPayload(response);
+    if (!response.ok) {
+      throw requestErrorFrom(response, payload);
+    }
+    if (payload?.status === "completed") {
+      return payload;
+    }
+  }
+
+  // Best effort: stop the job so it isn't billed for work nobody will see.
+  fetch(url, { method: "DELETE", headers }).catch(() => undefined);
+  throw new RestoreRequestError(
+    "OpenAI didn't finish the image within 10 minutes, so it was cancelled. Please try again.",
+  );
 }
 
 export default function Home() {
@@ -685,6 +769,36 @@ export default function Home() {
       }
     }
 
+    // Shrink the uploads to fit under the host's request size limit. Done once,
+    // since every variation sends the same images.
+    const sourceImage =
+      editImage ?? (!parent && mode === "restore" ? selectedFile ?? undefined : undefined);
+    let uploadImage: File | undefined;
+    let uploadReferences: File[];
+    try {
+      const fitted = await fitUploads(
+        sourceImage,
+        referenceImages.map((referenceImage) => referenceImage.file),
+        markupImage?.size ?? 0,
+      );
+      uploadImage = fitted.main?.file;
+      uploadReferences = fitted.references;
+      // The markup layer must match the uploaded image pixel for pixel.
+      if (markupImage && fitted.main?.resized && editDimensions) {
+        markupImage = await renderMarkupPng(
+          markupStrokes,
+          editDimensions.width,
+          editDimensions.height,
+          fitted.main.resized,
+        );
+      }
+    } catch {
+      setError({
+        message: "The images could not be prepared for upload. Try a smaller image or fewer reference images.",
+      });
+      return;
+    }
+
     const isBatch = variations.length > 1;
     setIsProcessing(true);
     setElapsedSeconds(0);
@@ -694,30 +808,32 @@ export default function Home() {
     const runVariation = async (settings: Variation): Promise<RestoreVersion> => {
       const formData = new FormData();
       formData.append("mode", mode);
-      if (editImage) {
-        formData.append("editImage", editImage);
+      if (editImage && uploadImage) {
+        formData.append("editImage", uploadImage);
         if (markupImage) {
           formData.append("markup", markupImage, "markup.png");
         }
       } else if (parent) {
         formData.append("previousResponseId", parent.responseId);
-      } else if (mode === "restore" && selectedFile) {
-        formData.append("image", selectedFile);
+      } else if (mode === "restore" && uploadImage) {
+        formData.append("image", uploadImage);
       }
       formData.append("prompt", promptText);
       formData.append("model", settings.model);
       formData.append("size", requestedSize);
       formData.append("quality", settings.quality);
       formData.append("complexity", settings.complexity);
-      referenceImages.forEach((referenceImage) => {
-        formData.append("referenceImage", referenceImage.file);
+      uploadReferences.forEach((referenceImage) => {
+        formData.append("referenceImage", referenceImage);
       });
 
+      const startedAt = Date.now();
+      const headers = apiKey ? { "x-openai-api-key": apiKey } : undefined;
       let response: Response;
       try {
         response = await fetch("/api/restore", {
           method: "POST",
-          headers: apiKey ? { "x-openai-api-key": apiKey } : undefined,
+          headers,
           body: formData,
         });
       } catch (networkError) {
@@ -726,18 +842,25 @@ export default function Home() {
           networkError instanceof Error ? networkError.name : undefined,
         );
       }
-      const payload = (await response.json().catch(() => null)) as Record<
-        string,
-        unknown
-      > | null;
+      let payload = await readJsonPayload(response);
 
       if (!response.ok) {
-        throw new RestoreRequestError(
-          typeof payload?.error === "string"
-            ? payload.error
-            : "The request was not accepted.",
-          typeof payload?.detail === "string" ? payload.detail : undefined,
-        );
+        throw requestErrorFrom(response, payload);
+      }
+
+      // Restore, generate and refine run as background jobs: wait for the image,
+      // then fold usage and timing into the metadata the job started with.
+      if (payload && typeof payload.jobId === "string") {
+        const finished = await waitForImageJob(payload.jobId, headers);
+        payload = {
+          ...finished,
+          metadata: {
+            ...(isRecord(payload.metadata) ? payload.metadata : {}),
+            usage: finished.usage,
+            cost: finished.cost,
+            durationMs: Date.now() - startedAt,
+          },
+        };
       }
 
       if (
