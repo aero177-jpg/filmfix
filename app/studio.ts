@@ -1,8 +1,12 @@
 import {
   BLACK_AND_WHITE_COLORIZE_PROMPT,
+  BLACK_AND_WHITE_COLORIZE_PROMPT_V2,
   BWGRAIN_PROMPT,
+  BWGRAIN_PROMPT_V2,
   DEFAULT_PROMPT,
+  DEFAULT_PROMPT_V2,
   RESTORE_PRESERVE_GRAIN_PROMPT,
+  RESTORE_PRESERVE_GRAIN_PROMPT_V2,
 } from "./prompts";
 
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
@@ -14,18 +18,36 @@ export const ACCEPT_ATTRIBUTE = ACCEPTED_TYPES.join(",");
 export type Mode = "restore" | "generate";
 export type Target = "new" | "refine" | "markup";
 export type PromptPreset = "restore" | "colorize";
+export type PromptVersion = "v1" | "v2";
 export type ComparisonSide = "left" | "right";
 export type Dimensions = { width: number; height: number };
+
+const PRESET_PROMPTS = {
+  v1: {
+    restore: DEFAULT_PROMPT,
+    restoreKeepGrain: RESTORE_PRESERVE_GRAIN_PROMPT,
+    colorize: BLACK_AND_WHITE_COLORIZE_PROMPT,
+    colorizeKeepGrain: BWGRAIN_PROMPT,
+  },
+  v2: {
+    restore: DEFAULT_PROMPT_V2,
+    restoreKeepGrain: RESTORE_PRESERVE_GRAIN_PROMPT_V2,
+    colorize: BLACK_AND_WHITE_COLORIZE_PROMPT_V2,
+    colorizeKeepGrain: BWGRAIN_PROMPT_V2,
+  },
+} as const;
 
 export function promptForPreset(
   preset: PromptPreset,
   removeArtifacts: boolean,
+  version: PromptVersion = "v2",
 ): string {
+  const prompts = PRESET_PROMPTS[version];
   if (preset === "colorize") {
-    return removeArtifacts ? BLACK_AND_WHITE_COLORIZE_PROMPT : BWGRAIN_PROMPT;
+    return removeArtifacts ? prompts.colorize : prompts.colorizeKeepGrain;
   }
 
-  return removeArtifacts ? DEFAULT_PROMPT : RESTORE_PRESERVE_GRAIN_PROMPT;
+  return removeArtifacts ? prompts.restore : prompts.restoreKeepGrain;
 }
 
 export const MODEL_OPTIONS = [

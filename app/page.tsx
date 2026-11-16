@@ -69,6 +69,7 @@ import {
   type GenerateSizePreset,
   type Mode,
   type PromptPreset,
+  type PromptVersion,
   type RestoreSizePreset,
   type RestoreVersion,
   type Target,
@@ -207,8 +208,9 @@ export default function Home() {
   const [generateSize, setGenerateSize] = useState<GenerateSizePreset>("auto");
   const [restorePreset, setRestorePreset] = useState<PromptPreset>("restore");
   const [removeArtifacts, setRemoveArtifacts] = useState(true);
+  const [promptVersion, setPromptVersion] = useState<PromptVersion>("v2");
   const [restorePrompt, setRestorePrompt] = useState(() =>
-    promptForPreset("restore", true),
+    promptForPreset("restore", true, "v2"),
   );
   const [generatePrompt, setGeneratePrompt] = useState("");
   const [refinePrompt, setRefinePrompt] = useState("");
@@ -406,7 +408,7 @@ export default function Home() {
     }
   };
 
-  const presetPrompt = promptForPreset(restorePreset, removeArtifacts);
+  const presetPrompt = promptForPreset(restorePreset, removeArtifacts, promptVersion);
   const activePrompt = isMarkup
     ? markupPrompt
     : isRefine
@@ -1375,11 +1377,28 @@ export default function Home() {
                     value={restorePreset}
                     onChange={(preset) => {
                       setRestorePreset(preset);
-                      setRestorePrompt(promptForPreset(preset, removeArtifacts));
+                      setRestorePrompt(
+                        promptForPreset(preset, removeArtifacts, promptVersion),
+                      );
                     }}
                     options={[
                       { value: "restore", label: "Restore" },
                       { value: "colorize", label: "Colorize B&W" },
+                    ]}
+                  />
+                  <Segmented
+                    label="Prompt version"
+                    size="sm"
+                    value={promptVersion}
+                    onChange={(version) => {
+                      setPromptVersion(version);
+                      setRestorePrompt(
+                        promptForPreset(restorePreset, removeArtifacts, version),
+                      );
+                    }}
+                    options={[
+                      { value: "v1", label: "Prompts v1" },
+                      { value: "v2", label: "v2" },
                     ]}
                   />
                   <Switch
@@ -1388,7 +1407,9 @@ export default function Home() {
                     checked={removeArtifacts}
                     onChange={(checked) => {
                       setRemoveArtifacts(checked);
-                      setRestorePrompt(promptForPreset(restorePreset, checked));
+                      setRestorePrompt(
+                        promptForPreset(restorePreset, checked, promptVersion),
+                      );
                     }}
                   />
                 </div>
